@@ -2,7 +2,7 @@
 
 Models task orchestration and threaded work. Methods decorated with `@Task` are registered at startup, validated before execution, and dispatched to typed thread pools via a priority-ordered queue system with no runtime reflection on the hot path.
 
-Requires **JDK 21+** (virtual threads via Project Loom).
+Requires **JDK 25 | 26**
 
 ---
 
@@ -106,7 +106,7 @@ Methods with parameters use a same-named static `Object[]` constant on the same 
 static final Object[] processRecord = { "input-key", 42 };
 
 @Task(POOL = "I", EXECUTER = "CEXC", OP = "processRecord", GROUP = 0, ORDER = 0.002)
-public void processRecord(String key, int count) { }
+public void processRecord(String key, int count) { 'process_a_record' }
 ```
 
 ---
@@ -122,7 +122,7 @@ public String buildResult() { return "computed"; }
 
 // Must be AEXC or IEXC -- CEXC would block an OS thread on the bus wait
 @Task(POOL = "P", EXECUTER = "AEXC", OP = "processResult", GROUP = 0, ORDER = 0.5)
-public void processResult(String value) { }
+public void processResult(String value) { 'process_a_result' }
 ```
 
 Chains can be arbitrarily long. A mid-chain node that both receives input and returns output is supported. The full type graph is proven at seal time.
@@ -136,7 +136,7 @@ LEAD tasks bypass the front priority queue and always pull before any GROUP/ORDE
 ```java
 @Task(POOL = "I", EXECUTER = "CEXC", OP = "priorityWork",
         GROUP = 0, ORDER = 0.001, LEAD = 0)
-public void priorityWork() { }
+public void priorityWork() { 'do_priority_work' }
 ```
 
 LEAD `0` always pulls before LEAD `1`, `2`, and so on.
