@@ -290,11 +290,11 @@ public class Main {
         //   P pool (1 core):  asyncWork, asyncHelper
         //   H pool (2 cores): cpuWork, cpuHelper
         Pools.PoolConfig config = new Pools.PoolConfig.Builder()
-                .iPool(4)
-                .pPool(2)
-                .hPool(2)
+                .iPool(2)
+                .pPool(1)
+                .hPool(1)
                 .rPool(0)
-                .workersPerCore(1)
+                .workersPerCore(3)
                 .build();
 
         System.out.println(">> initializing handler...");

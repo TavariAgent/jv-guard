@@ -163,7 +163,7 @@ public void buildResult() { 'build_some_result' }
 
 // Stateless — bypasses phase entirely, fans out to any free worker
 @Task(POOL = "I", EXECUTER = "CEXC", OP = "hashChunk", LEAD = 0, STATE_LOCK = false)
-public void hashChunk() { 'check_some_chunk' }
+public void hashChunk() { 'hash_some_chunk' }  // not to be confused with 'check_some_chunk'
 ```
 
 ### `MIRROR` _(String, default: `""`)_
@@ -191,9 +191,9 @@ public void processResult(String value) { 'process_some_strings' }
 
 ## Performance
 
-Measured on a Ryzen 7800X3D (8 cores, SMT off):
+Measured on a Ryzen 7800X3D (4 cores used, SMT off):
 
-![jv-guard](assets/jvguardfast.png)
+![jv-guard](assets/jvguardspeed.png)
 
 ---
 
@@ -207,13 +207,10 @@ Measured on a Ryzen 7800X3D (8 cores, SMT off):
 
 ---
 
-## Related
 
-jv-guard is part of a multi-language threading engine family at [tavari.online](https://tavari.online).
-
-| Project  | Language | Status      |
-|----------|----------|-------------|
-| tg-guard | Python   | Public      |
-| jv-guard | Java     | This repo   |
-| Invoke   | Go       | Public      |
-| c-guard  | C        | In progress |
+| Project    | Language | Status      |
+|------------|----------|-------------|
+| tg-guard   | Python   | Public      |
+| jv-guard   | Java     | This repo   |
+| Invoke     | Go       | Public      |
+| csharpener | C#       | public      |
