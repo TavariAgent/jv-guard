@@ -9,25 +9,25 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * jv-guard -- extended smoke test + performance batch test
- *
+ * <p>
  * Smoke test task graph (9 total, all call done()):
- *
+ * <p>
  *   main submits:
  *     asyncWork  (P pool orchestrator)
  *     ioWork     (I pool, IEXC)
  *     paramWork  (I pool, CEXC, pre-bound args)
- *
+ * <p>
  *   asyncWork triggers:
  *     leadWork   (I pool, LEAD:0, heavy hash)
  *     cpuWork    (H pool, LEAD:1, randomized harmonic hash)
  *     asyncHelper (P pool, ORDER:0.7, post-orchestration)
- *
+ * <p>
  *   leadWork triggers:
  *     leadHelper  (I pool, ORDER:0.5, lighter follow-up hash)
- *
+ * <p>
  *   cpuWork triggers:
  *     cpuHelper   (H pool, ORDER:0.6, pre-bound rounds)
- *
+ * <p>
  *   ioWork triggers:
  *     ioHelper    (I pool, IEXC, ORDER:0.6, aggregation)
  */
@@ -325,7 +325,7 @@ public class Main {
         System.out.println("\n=== Performance Batch Test ===");
         System.out.println("  task: batchWork (SHA-256 x25, I pool, CEXC)\n");
 
-        int[] batchSizes = { 1_000, 5_000, 10_000 , 100_000, 1_000_000, 10_000_000 };
+        int[] batchSizes = { 1_000, 5_000, 10_000, 100_000, 1_000_000, 10_000_000, 15_000_000, 20_000_000, 25_000_000 };
 
         for (int size : batchSizes) {
             CountDownLatch batchLatch = new CountDownLatch(size);

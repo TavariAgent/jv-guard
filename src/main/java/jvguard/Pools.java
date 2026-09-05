@@ -1,21 +1,22 @@
 package jvguard;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * jv-guard - Pools
- *
+ * <p>
  * CoreRegistry construction, per-pool queue management, LEAD suffix allocation,
  * and idle worker spin loops. Called once after Wrapping.seal().
- *
+ * <p>
  * Startup sequence:
- *
+ * <p>
  *     PoolConfig config = new PoolConfig.Builder()
  *         .iPool(2)
  *         .pPool(2)
@@ -23,13 +24,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  *         .rPool(0)            // rPool grows dynamically from iPool at runtime
  *         .workersPerCore(4)   // matches c-guard baseline
  *         .build();
- *
+ * <p>
  *     CoreRegistry registry = Pools.build(config, dispatcher);
- *
+ * <p>
  * The TaskDispatcher (provided by Handler) receives a DispatchPacket when a
  * worker pulls a task. DispatchPacket carries the task plus any LEAD suffix
  * context needed for release - no external tracking required.
- *
+ * <p>
  * Pool affinity is behavioural: idle workers spin continuously via
  * Thread.onSpinWait() (CPU PAUSE hint on x86). A thread that never blocks
  * gives the OS no preemption trigger - the core stays warm and cache locality
@@ -56,7 +57,7 @@ public final class Pools {
     /**
      * Builds the CoreRegistry, assigns cores to pools, spawns idle workers,
      * and starts them spinning. Returns the sealed registry for Handler to hold.
-     *
+     * <p>
      * If total requested cores exceed availableProcessors(), the build caps
      * to available and logs a warning - partial assignment, not a failure.
      */
@@ -75,7 +76,7 @@ public final class Pools {
 
         // One PoolQueue per pool type - shared across all cores of that type
         for (String pool : new String[]{ I_POOL, P_POOL, H_POOL, R_POOL }) {
-            poolQueues.put(pool, new PoolQueue(pool));
+            poolQueues.put(pool, new PoolQueue());
         }
 
         // Assign core IDs sequentially across pool types
@@ -90,9 +91,9 @@ public final class Pools {
                 config.rPoolCores(), config.workersPerCore(), dispatcher, nextId, available);
 
         CoreRegistry registry = new CoreRegistry(
-                Collections.unmodifiableList(cores),
-                Collections.unmodifiableMap(poolQueues),
-                Collections.unmodifiableList(workers)
+                List.copyOf(cores),
+                Map.copyOf(poolQueues),
+                List.copyOf(workers)
         );
 
         activeRegistry = registry;
@@ -137,15 +138,17 @@ public final class Pools {
     ) {
         if (count == 0) return startId;
 
-        PoolQueue queue = poolQueues.get(poolType);
-        int       id    = startId;
+        PoolQueue queue        = poolQueues.get(poolType);
+        int       id           = startId;
+        int       totalWorkers = 0; // per-pool worker count for idle slot sizing
 
         for (int i = 0; i < count && id < cap; i++, id++) {
             cores.add(new CoreEntry(id, poolType));
 
             for (int w = 0; w < workersPerCore; w++) {
+                final int    slot = totalWorkers++; // unique slot index within this pool
                 final String name = "jvg-" + poolType.toLowerCase() + "-" + id + "-w" + w;
-                Thread worker = new Thread(() -> idleWorker(queue, dispatcher, name));
+                Thread worker = new Thread(() -> idleWorker(queue, dispatcher, name, slot));
                 worker.setName(name);
                 workers.add(worker);
             }
@@ -154,6 +157,7 @@ public final class Pools {
                     + "Pool (" + workersPerCore + " worker(s))");
         }
 
+        queue.init(totalWorkers); // size the idle slot array now that worker count is known
         return id;
     }
 
@@ -162,52 +166,63 @@ public final class Pools {
     // -------------------------------------------------------------------------
 
     /**
-     * Spin loop for a single worker thread.
-     *
-     * Priority order on each spin:
-     *   1. Back segment (LEAD pinnacle tasks) - always checked first.
-     *      pollBack() returns an EnrichedLeadTask carrying both the task
-     *      and its suffix. Both are packed into the DispatchPacket.
-     *   2. Front segment (regular GROUP/ORDER tasks) - checked if back is empty.
-     *      PriorityBlockingQueue ensures workers always receive the lowest
-     *      available (GROUP, ORDER) task regardless of insertion order.
-     *   3. Thread.onSpinWait() - emitted when both segments are empty.
-     *      Emits CPU PAUSE hint (x86): reduces power draw and prevents
-     *      memory order violations in tight spin loops. The thread never
-     *      releases the core - this is what creates behavioural pool affinity.
+     * Park-based idle loop for a single worker thread.
+     * <p>
+     * Priority order on each iteration:
+     *   1. Stateless lead segment - STATE_LOCK: false tasks bypass GROUP phase
+     *      entirely. Direct line from offerStatelessLead() to any free worker.
+     *      No suffix allocated, no skip-list ordering.
+     *   2. Back segment (LEAD pinnacle tasks) - ordered by (lead, promotedOrder).
+     *      EnrichedLeadTask carries task + suffix together.
+     *   3. Front segment (regular GROUP/ORDER tasks) - PriorityBlockingQueue
+     *      ordered by (GROUP ascending, ORDER ascending).
+     *   4. Idle park - when all segments are empty, register in the idle slot
+     *      array and call LockSupport.park(). A double-check after registration
+     *      catches tasks that arrived between the poll and the park. Unparked
+     *      by signalIdleWorker() when new stateless work arrives, or wakes on
+     *      interrupt to exit cleanly.
      */
     private static void idleWorker(
             PoolQueue      queue,
             TaskDispatcher dispatcher,
-            String         name
+            String         name,
+            int            workerSlot
     ) {
         while (!Thread.currentThread().isInterrupted()) {
 
-            // Back first - LEAD pinnacle work, highest priority
-            // EnrichedLeadTask carries task + suffix together
+            // Stateless leads - STATE_LOCK: false bypass, fills idle capacity
+            Wrapping.TaskDescriptor stateless = queue.pollStatelessFront();
+            if (stateless != null) {
+                dispatcher.dispatch(stateless, -1, null);
+                continue;
+            }
+
+            // Back - LEAD pinnacle work, suffix travels in EnrichedLeadTask
             PoolQueue.EnrichedLeadTask leadTask = queue.pollBack();
             if (leadTask != null) {
-                dispatcher.dispatch(new DispatchPacket(
-                        leadTask.task(),
-                        leadTask.suffix(),
-                        queue
-                ));
+                dispatcher.dispatch(leadTask.task(), leadTask.suffix(), queue);
                 continue;
             }
 
             // Front - regular GROUP/ORDER tasks
-            // PriorityBlockingQueue.poll() returns lowest (GROUP, ORDER) or null
             Wrapping.TaskDescriptor task = queue.pollFront();
             if (task != null) {
-                dispatcher.dispatch(new DispatchPacket(task, -1, null));
+                dispatcher.dispatch(task, -1, null);
                 continue;
             }
 
-            // Both segments empty - spin with CPU pause hint
-            Thread.onSpinWait();
+            // No work found - register idle and park until signaled or interrupted
+            queue.registerIdle(workerSlot, Thread.currentThread());
+            if (!queue.hasWork()) {
+                // Double-check: work may have landed between the last poll and register.
+                // If still empty, park. The unpark from signalIdleWorker() (or interrupt)
+                // will wake this thread immediately if it already arrived.
+                LockSupport.park();
+            }
+            queue.deregisterIdle(workerSlot, Thread.currentThread());
         }
 
-        log.info(name + " interrupted - exiting spin loop");
+        log.info(name + " interrupted - exiting loop");
     }
 
     // -------------------------------------------------------------------------
@@ -217,32 +232,14 @@ public final class Pools {
     /**
      * Functional interface for handing a ready task to Handler.
      * Implemented by Handler and provided to Pools.build() at startup.
-     * Workers call dispatch() with a DispatchPacket when a task is pulled.
-     * Keeps Pools decoupled from Handler and Executers.
+     * <p>
+     * Fields are passed directly — no DispatchPacket boxing, no heap allocation
+     * per dispatch. LEAD tasks carry suffix >= 1 and a non-null sourceQueue;
+     * regular tasks carry suffix == -1 and null sourceQueue.
      */
     @FunctionalInterface
     public interface TaskDispatcher {
-        void dispatch(DispatchPacket packet);
-    }
-
-    // -------------------------------------------------------------------------
-    // DispatchPacket
-    // -------------------------------------------------------------------------
-
-    /**
-     * Thin envelope passed from idle workers to Handler via TaskDispatcher.
-     * Carries the task alongside LEAD suffix context so Handler can release
-     * the suffix after execution without any external tracking map.
-     *
-     * LEAD tasks:     leadSuffix >= 1, sourceQueue non-null
-     * Regular tasks:  leadSuffix == -1, sourceQueue null
-     */
-    public record DispatchPacket(
-            Wrapping.TaskDescriptor task,
-            int                     leadSuffix,
-            PoolQueue               sourceQueue
-    ) {
-        public boolean isLead() { return leadSuffix >= 1; }
+        void dispatch(Wrapping.TaskDescriptor task, int leadSuffix, PoolQueue sourceQueue);
     }
 
     // -------------------------------------------------------------------------
@@ -311,33 +308,31 @@ public final class Pools {
     /**
      * Per-pool shared queue. Shared across all cores of the same pool type.
      * All workers in a pool read from the same instance.
-     *
+     * <p>
      * Two segments:
-     *
+     * <p>
      *   Front  - PriorityBlockingQueue<TaskDescriptor>
      *     Regular tasks. Ordered by (GROUP ascending, ORDER ascending).
      *     Workers always receive the lowest available (GROUP, ORDER) task
      *     regardless of concurrent insertion order. poll() is non-blocking.
-     *
+     * <p>
      *   Back   - ConcurrentSkipListMap<LeadKey, EnrichedLeadTask>
      *     LEAD pinnacle tasks. Sorted by (lead integer, promotedOrder).
      *     Lower LEAD integer = higher priority. LEAD: 0 always first.
      *     Each entry stores the task and its suffix together (EnrichedLeadTask)
      *     so the DispatchPacket can carry both without external tracking.
-     *
+     * <p>
      * LEAD suffix allocation:
-     *
+     * <p>
      *   Each LEAD integer has a free list (ConcurrentLinkedDeque<Integer>).
      *   When LEAD: 0 arrives and free list is empty -> counter increments -> suffix 1.
      *   When another LEAD: 0 arrives -> suffix 2. First completes -> releases _1.
      *   Next LEAD: 0 arrival -> reclaims _1 (lowest recycled first).
-     *
+     * <p>
      *   Promoted sort key = suffix (whole number) + ORDER (fractional part).
      *   Ranges [1.0,2.0), [2.0,3.0) ... never overlap - collision-free.
      */
     public static final class PoolQueue {
-
-        private final String poolType;
 
         // Front segment - regular tasks, auto-ordered by (GROUP, ORDER)
         private final PriorityBlockingQueue<Wrapping.TaskDescriptor> front =
@@ -350,6 +345,15 @@ public final class Pools {
         private final ConcurrentSkipListMap<LeadKey, EnrichedLeadTask> back =
                 new ConcurrentSkipListMap<>();
 
+        // Stateless lead segment - STATE_LOCK: false tasks, FIFO, no ordering needed
+        private final ConcurrentLinkedQueue<Wrapping.TaskDescriptor> statelessFront =
+                new ConcurrentLinkedQueue<>();
+
+        // Idle worker registry - one slot per worker in this pool
+        // Sized by init(); CAS-managed by registerIdle/deregisterIdle/signalIdleWorker
+        private volatile AtomicReferenceArray<Thread> idleSlots = null;
+        private final AtomicInteger idleCount = new AtomicInteger(0);
+
         // Per-LEAD free lists - recycled suffix integers, lowest first
         private final ConcurrentHashMap<Integer, ConcurrentLinkedDeque<Integer>> leadFreeLists =
                 new ConcurrentHashMap<>();
@@ -358,15 +362,24 @@ public final class Pools {
         private final ConcurrentHashMap<Integer, AtomicInteger> leadCounters =
                 new ConcurrentHashMap<>();
 
-        PoolQueue(String poolType) {
-            this.poolType = poolType;
+        PoolQueue() {}
+
+        // --- Initialization ---------------------------------------------------
+
+        /**
+         * Sizes the idle slot array. Called once by assignCores() after the total
+         * worker count for this pool is known. Must complete before workers start.
+         */
+        void init(int workerCount) {
+            this.idleSlots = new AtomicReferenceArray<>(workerCount);
         }
 
         // --- Front ------------------------------------------------------------
 
-        /** Deposits a regular task into the front priority queue. */
+        /** Deposits a regular task into the front priority queue and wakes one idle worker. */
         public void offerFront(Wrapping.TaskDescriptor task) {
             front.offer(task);
+            signalIdleWorker();
         }
 
         /**
@@ -390,6 +403,7 @@ public final class Pools {
             double promotedKey = suffix + task.order();
             back.put(new LeadKey(task.lead(), promotedKey),
                     new EnrichedLeadTask(task, suffix));
+            signalIdleWorker();
         }
 
         /**
@@ -402,6 +416,70 @@ public final class Pools {
         }
 
         public boolean backIsEmpty() { return back.isEmpty(); }
+
+        // --- Stateless lead segment -------------------------------------------
+
+        /**
+         * Deposits a stateless lead task (STATE_LOCK: false) and signals one idle
+         * worker. Stateless leads bypass GROUP phase and the skip list entirely —
+         * direct line to any available worker. Fan-out in parallel, no suffix.
+         */
+        public void offerStatelessLead(Wrapping.TaskDescriptor task) {
+            statelessFront.offer(task);
+            signalIdleWorker();
+        }
+
+        /** Polls the next stateless lead task. Returns null if none pending. */
+        public Wrapping.TaskDescriptor pollStatelessFront() {
+            return statelessFront.poll();
+        }
+
+        /** True if any segment has work. Used for idle double-check before park. */
+        public boolean hasWork() {
+            return !statelessFront.isEmpty() || !back.isEmpty() || !front.isEmpty();
+        }
+
+        // --- Idle worker registry --------------------------------------------
+
+        /**
+         * Registers a worker thread into its slot, visible for unpark signaling.
+         * Called just before LockSupport.park() in the worker loop.
+         */
+        public void registerIdle(int slot, Thread thread) {
+            AtomicReferenceArray<Thread> slots = idleSlots;
+            if (slots != null && slots.compareAndSet(slot, null, thread)) {
+                idleCount.incrementAndGet();
+            }
+        }
+
+        /**
+         * Removes a worker from the idle slot array on wakeup.
+         * CAS ensures only the registering thread clears its own slot.
+         */
+        public void deregisterIdle(int slot, Thread thread) {
+            AtomicReferenceArray<Thread> slots = idleSlots;
+            if (slots != null && slots.compareAndSet(slot, thread, null)) {
+                idleCount.decrementAndGet();
+            }
+        }
+
+        /**
+         * Scans the idle slot array for a parked worker, CAS-claims one slot,
+         * and calls LockSupport.unpark() on that thread. Called by offerStatelessLead()
+         * and may also be called by Handler.submit() when routing any stateless work.
+         */
+        public void signalIdleWorker() {
+            AtomicReferenceArray<Thread> slots = idleSlots;
+            if (slots == null || idleCount.get() == 0) return;
+            for (int i = 0; i < slots.length(); i++) {
+                Thread t = slots.get(i);
+                if (t != null && slots.compareAndSet(i, t, null)) {
+                    idleCount.decrementAndGet();
+                    LockSupport.unpark(t);
+                    return;
+                }
+            }
+        }
 
         // --- LEAD suffix management -------------------------------------------
 
@@ -449,13 +527,13 @@ public final class Pools {
 
     /**
      * Composite sort key for the back-segment ConcurrentSkipListMap.
-     *
+     * <p>
      * Sort order:
      *   1. lead integer - lower value = higher pinnacle priority.
      *      LEAD: 0 always before LEAD: 1, LEAD: 2, etc.
      *   2. promotedOrder - within the same LEAD, lower promoted order runs first.
      *      promotedOrder = suffix (whole number) + ORDER decimal.
-     *
+     * <p>
      * Collision guarantee: suffixes are unique non-overlapping integers per LEAD
      * and ORDER is validated to [0.0, 1.0). The promoted ranges [1.0,2.0),
      * [2.0,3.0) ... never overlap. Two tasks can never produce an identical
@@ -477,7 +555,7 @@ public final class Pools {
 
     /**
      * User-facing pool configuration. Build with the inner Builder.
-     *
+     * <p>
      *     PoolConfig config = new PoolConfig.Builder()
      *         .iPool(2)
      *         .pPool(2)
@@ -485,7 +563,7 @@ public final class Pools {
      *         .rPool(0)           // rPool starts empty; grows from iPool at runtime
      *         .workersPerCore(4)  // default 4
      *         .build();
-     *
+     * <p>
      * Total cores should not exceed Runtime.availableProcessors().
      * Over-assignment is capped with a warning, not an error.
      */

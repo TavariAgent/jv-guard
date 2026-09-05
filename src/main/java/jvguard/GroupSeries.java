@@ -5,34 +5,34 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * jv-guard - GroupSeries
- *
+ * <p>
  * Demonstrates GROUP-ordered MIRROR chains by computing two mathematical
  * constants in sequence, with the first result feeding the second.
- *
- * ── Stage 1: Leibniz series for PI ──────────────────────────────────────────
- *
+ * <p>
+ * ── Stage 1: Leibniz series for PI
+ * <p>
  *   π/4 = Σ(k=0..∞) (−1)^k / (2k+1)   →   π = 4 × (1 − 1/3 + 1/5 − ...)
- *
+ * <p>
  *   10 GROUP stages × 10M terms = 100M total.
  *   Each stage is a separate @Task on the I pool computing one chunk.
  *   MIRROR carries the partial sum (Double) from stage to stage.
- *
- * ── Stage 2: Glaisher-Kinkelin constant A via Barnes G ──────────────────────
- *
+ * <p>
+ * ── Stage 2: Glaisher-Kinkelin constant A via Barnes G
+ * <p>
  *   Uses the Barnes G asymptotic expansion:
  *     ln G(N+2) = Σ(j=1..N) (N−j+1)·ln(j)                  [sum S]
  *     ln(A)     = S − (N²/2 + N/2)·ln(N) + 3N²/4 − N/2·ln(2π) + 1/12·ln(N)
- *
+ * <p>
  *   The ln(2π) correction is computed using the PI received from the Leibniz
  *   chain. Leibniz approximation error propagates into A -- this is intentional:
  *   it demonstrates typed error propagation across the MIRROR boundary.
- *
+ * <p>
  *   10 GROUP stages × 1,000 terms (j) = N=10,000 total.
  *   Each stage accumulates a chunk of (N−j+1)·ln(j) on the P pool.
  *   Expected accuracy: ~6 significant digits of A (double-precision limit at N=10k).
- *
- * ── MIRROR type chain ────────────────────────────────────────────────────────
- *
+ * <p>
+ * ── MIRROR type chain
+ * <p>
  *   leibnizOp0  -> Double          -> leibnizOp1          (root producer, CEXC)
  *   leibnizOp1  -> Double          -> leibnizOp2          (mid-chain, IEXC)
  *   ...
@@ -42,28 +42,28 @@ import java.util.concurrent.TimeUnit;
  *   ...
  *   glashierOp8 -> GlaishierState  -> glashierOp9         (mid-chain, AEXC)
  *   glashierOp9 : terminal consumer, applies final formula
- *
+ * <p>
  *   All 20 edges are type-validated at seal() before any task runs.
  *   A type mismatch at any edge is reported with the exact chain location.
- *
- * ── GROUP role ───────────────────────────────────────────────────────────────
- *
+ * <p>
+ * ── GROUP role
+ * <p>
  *   In this design, MIRROR auto-submit enforces the execution order -- each
  *   stage is submitted only after the previous completes. GROUP labels each
  *   stage correctly and would be the primary ordering mechanism if tasks were
  *   pre-submitted simultaneously (batch mode) rather than chained.
  *   GROUP and MIRROR are complementary tools: GROUP for queue ordering,
  *   MIRROR for typed data-dependency sequencing.
- *
- * ── Task count ───────────────────────────────────────────────────────────────
- *
+ * <p>
+ * ── Task count
+ * <p>
  *   chainStagger  1
  *   leibnizOp0-9  10  (GROUP 0-9 on I pool)
  *   glashierOp0-9 10  (GROUP 0-9 on P pool)
  *   Total:        21  all call done() exactly once
- *
- * ── Expected runtime ─────────────────────────────────────────────────────────
- *
+ * <p>
+ * ── Expected runtime
+ * <p>
  *   ~1-2 seconds (100M floating-point additions dominate; Glaisher is fast).
  */
 public class GroupSeries {
@@ -75,7 +75,7 @@ public class GroupSeries {
     /**
      * Immutable state container passed through the Glaisher MIRROR chain.
      * Each mid-chain node returns a new instance with sumSoFar and nextJ updated.
-     *
+     * <p>
      *   pi:       computed PI from the completed Leibniz chain
      *   sumSoFar: Σ(j=1..nextJ-1) (N−j+1)·ln(j) accumulated so far
      *   nextJ:    index of the next j value to compute (starts at 1, ends at N)
@@ -236,11 +236,11 @@ public class GroupSeries {
 
         /**
          * BRIDGE. GROUP:9. Final Leibniz stage and first Glaisher stage.
-         *
+         * <p>
          * Receives accumulated partial sum (Double) from leibnizOp8.
          * Computes the last 10M Leibniz terms, multiplies by 4 to get PI.
          * Returns GlaishierState wrapping PI and initialising the Glaisher sum.
-         *
+         * <p>
          * This is a mid-chain node: Double in, GlaishierState out.
          * seal() validates both edges:
          *   input:  Double         ← Double         (from leibnizOp8)
@@ -361,13 +361,13 @@ public class GroupSeries {
 
         /**
          * TERMINAL consumer. GROUP:9.
-         *
+         * <p>
          * Receives GlaishierState with S accumulated over j=1..9,000.
          * Computes the final chunk (j=9,001..10,000) then applies the
          * Barnes G asymptotic correction to extract ln(A):
-         *
+         * <p>
          *   ln(A) = S − (N²/2 + N/2)·ln(N) + 3N²/4 − N/2·ln(2π) + 1/12·ln(N)
-         *
+         * <p>
          * π in ln(2π) is the value received from the Leibniz chain. Leibniz
          * approximation error propagates here -- this is by design.
          * Expected accuracy: ~6 significant digits at N=10,000.
@@ -418,7 +418,7 @@ public class GroupSeries {
 
         /**
          * Computes one chunk of the Leibniz partial sum.
-         *
+         * <p>
          * groupIndex: which of the 10 groups (0-9).
          * k range: groupIndex × LEIBNIZ_CHUNK  to  (groupIndex+1) × LEIBNIZ_CHUNK − 1
          * Contribution: Σ(k in range) (−1)^k / (2k+1)
@@ -436,7 +436,7 @@ public class GroupSeries {
 
         /**
          * Computes one chunk of the Barnes G sum.
-         *
+         * <p>
          * Adds (N−j+1)·ln(j) for j = state.nextJ to state.nextJ + GLAISHER_CHUNK − 1.
          * Returns a new GlaishierState with sumSoFar and nextJ advanced by one chunk.
          */

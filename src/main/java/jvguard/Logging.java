@@ -5,17 +5,17 @@ import java.time.format.DateTimeFormatter;
 
 /**
  * jv-guard - Logging
- *
+ * <p>
  * Lightweight internal logger for the jv-guard engine.
  * No external dependencies. INFO and WARN route to stdout,
  * ERROR routes to stderr.
- *
+ * <p>
  * Usage (at the top of any jv-guard class):
- *
+ * <p>
  *     private static final Logging.JvLogger log = Logging.get(MyClass.class);
- *
+ * <p>
  * Then anywhere in that class:
- *
+ * <p>
  *     log.info("registry sealed - 12 methods registered");
  *     log.warn("ORDER: 1.5 invalid, defaulted to 0.0", "OrderService.processChild");
  *     log.error("executor failed to start", "Executers.runningCpuExecutor");

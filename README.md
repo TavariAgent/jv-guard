@@ -47,33 +47,38 @@ Requires **JDK 21+** (virtual threads via Project Loom).
 class WorkService {
 
     @Task(POOL = "I", EXECUTER = "CEXC", OP = "crunchData", GROUP = 0, ORDER = 0.001)
-    public void crunchData() { }
+    public void crunchData() { 'some_data_crunch'}
 
     @Task(POOL = "P", EXECUTER = "AEXC", OP = "orchestrate", GROUP = 0, ORDER = 0.001)
     public void orchestrate() {
         Handler.get().submit("crunchData");
     }
+    
+    public static void main() {
+
+        // 2. Register and seal
+        Wrapping.register(new WorkService());
+        Wrapping.seal();
+
+        // 3. Configure pools
+        Pools.PoolConfig config = new Pools.PoolConfig.Builder()
+                .iPool(2).pPool(1).hPool(2).rPool(0).workersPerCore(3).build();
+
+        // 4. Start
+        Handler.initialize(config);
+        MirrorBus.initialize();
+        Executers.start();
+
+        // 5. Submit
+        Handler.get().submit("orchestrate");
+
+        // 6. Shutdown
+        Executers.shutdown();
+        Pools.getRegistry().shutdown();
+        
+    }
 }
 
-// 2. Register and seal
-Wrapping.register(new WorkService());
-Wrapping.seal();
-
-// 3. Configure pools
-Pools.PoolConfig config = new Pools.PoolConfig.Builder()
-        .iPool(2).pPool(1).hPool(2).rPool(0).workersPerCore(3).build();
-
-// 4. Start
-Handler.initialize(config);
-MirrorBus.initialize();
-Executers.start();
-
-// 5. Submit
-Handler.get().submit("orchestrate");
-
-// 6. Shutdown
-Executers.shutdown();
-Pools.getRegistry().shutdown();
 ```
 
 ---
@@ -90,7 +95,7 @@ Pools.getRegistry().shutdown();
 | `LEAD`      | `int`      | no        | `-1`              | Pinnacle rank -- `0` is highest, `-1` disables                         |
 | `MIRROR`    | `String`   | no        | `""`              | OP of the consumer that receives this task's return value              |
 | `CACHE`     | `boolean`  | no        | `true`            | Pre-compile a `MethodHandle` at seal time for the hot invocation path  |
-
+| `STATE_LOCK`| `boolean`  | no        | `false`           | Fulfill this lead when applying group phase or order if workers remain |
 ---
 
 ## Parameterized tasks
@@ -138,6 +143,46 @@ LEAD `0` always pulls before LEAD `1`, `2`, and so on.
 
 ---
 
+## Annotation Fields
+
+### `STATE_LOCK` _(boolean, default: `true`)_
+
+Controls whether a `LEAD` task participates in GROUP phase ordering.
+
+| Value   | Behaviour                                                                                                                                                                                                                                                                                                                                                  |
+|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `true`  | **Stateful lead.** Enters the back skip-list and is dispatched in LEAD / ORDER priority order, respecting GROUP phase. MIRROR producer-consumer chains work normally on this path.                                                                                                                                                                         |
+| `false` | **Stateless lead.** Bypasses the skip-list and GROUP phase entirely. Dispatched directly to any free (idle/parked) worker via work signal. Multiple stateless leads fan out in parallel across available workers — no phase gate, no suffix allocated. Use for idempotent, order-independent LEAD work that should fill idle capacity as fast as possible. |
+
+> Only meaningful when `LEAD >= 0`. Ignored on non-LEAD tasks (`LEAD == -1`).
+
+```java
+// Stateful — respects GROUP phase, safe for MIRROR chains
+@Task(POOL = "P", EXECUTER = "CEXC", OP = "buildResult", LEAD = 0)
+public void buildResult() { 'build_some_result' }
+
+// Stateless — bypasses phase entirely, fans out to any free worker
+@Task(POOL = "I", EXECUTER = "CEXC", OP = "hashChunk", LEAD = 0, STATE_LOCK = false)
+public void hashChunk() { 'check_some_chunk' }
+```
+
+### `MIRROR` _(String, default: `""`)_
+
+Declares this task as a producer in a MIRROR chain. The engine captures the return value after normal execution and routes it to the named consumer OP via the mirror bus. The consumer is auto-submitted once the value is available.
+
+- The consumer must accept the producer's return type as its first parameter.
+- Consumer `EXECUTER` must be `AEXC` or `IEXC` — `CEXC` blocks an OS thread awaiting the result, which is a Tier 1 violation at `seal()`.
+
+```java
+@Task(POOL = "P", EXECUTER = "CEXC", OP = "buildResult", MIRROR = "processResult")
+public String buildResult() { return "value"; }
+
+@Task(POOL = "P", EXECUTER = "AEXC", OP = "processResult")
+public void processResult(String value) { 'process_some_strings' }
+```
+
+---
+
 ## Validation
 
 `seal()` runs two tiers before any executor starts. **Tier 1** blocks on invalid `POOL`, `EXECUTER`, blank `OP`, negative `GROUP`, out-of-range `LEAD`, missing args constants, duplicate OP names, MIRROR type mismatches, and CEXC consumers. All violations are collected and thrown together. **Tier 2** silently defaults invalid `ORDER` on non-LEAD tasks to `0.0` with a warning; invalid `ORDER` on LEAD tasks is a hard block.
@@ -146,15 +191,9 @@ LEAD `0` always pulls before LEAD `1`, `2`, and so on.
 
 ## Performance
 
-Measured on a Ryzen 7800X3D (8 cores, 96MB L3), task = SHA-256 x 25 rounds, I pool CEXC:
+Measured on a Ryzen 7800X3D (8 cores, SMT off):
 
-| Batch size | Throughput                     |
-|------------|--------------------------------|
-| 1,000      | ~32K tasks/s (JIT cold)        |
-| 10,000     | ~301K tasks/s                  |
-| 100,000    | ~973K tasks/s                  |
-| 1,000,000  | ~1.30M tasks/s                 |
-| 10,000,000 | ~1.36M tasks/s (steady state)  |
+![jv-guard](assets/jvguardfast.png)
 
 ---
 

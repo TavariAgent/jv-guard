@@ -9,37 +9,37 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * jv-guard - CompleteChaosTester
- *
+ * <p>
  * Full engine chaos test covering every major feature in sequence.
  * Each scenario runs against its own CountDownLatch. Tasks call done()
  * exactly once per invocation. Scenarios are waited out before proceeding
  * so latch swaps never collide with in-flight tasks.
- *
+ * <p>
  * Scenarios:
- *
+ * <p>
  *   1. rPool commands (3 tasks)
  *      P pool orchestrator fires two R pool command tasks.
  *      Confirms R pool isolation -- command workers run on separate cores.
- *
+ * <p>
  *   2. Two-step MIRROR -- I CEXC → P AEXC (2 tasks)
  *      Producer hashes a payload and returns a hex String.
  *      Consumer receives it via MirrorBus, confirms typed delivery.
- *
+ * <p>
  *   3. Three-step MIRROR chain -- I CEXC → I IEXC → P AEXC (3 tasks)
  *      Root producer returns Integer. Mid-chain node receives Integer,
  *      hashes it, returns String. Terminal consumer receives String.
  *      Exercises invokeMidChain() and the two-field type write in seal().
- *
+ * <p>
  *   4. Concurrent LEAD storm (7 tasks)
  *      Orchestrator fires 3x LEAD:0 (I pool) and 3x LEAD:1 (H pool).
  *      Confirms suffix allocation, LEAD:0 always drains before LEAD:1,
  *      and concurrent suffix recycling is clean.
- *
+ * <p>
  *   5. Async orchestration wave (21 tasks)
  *      P pool orchestrator fires 20 lightweight I pool tasks in a burst.
  *      Exercises queue depth, worker saturation, and throughput under
  *      orchestrated async load.
- *
+ * <p>
  * Pool layout:
  *   I pool (2 cores)  - idempotent, MIRROR producers and mid-chain
  *   P pool (1 core)   - protocol, MIRROR consumers and orchestrators

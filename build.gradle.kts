@@ -1,19 +1,14 @@
 plugins {
-    id("java")
-    id("application")
+    id("java-library")
 }
 
-group = "online.tavari"
+group = "com.tavari"
 version = "1.0-SNAPSHOT"
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(26)
+        languageVersion = JavaLanguageVersion.of(25)
     }
-}
-
-configure<JavaApplication> {
-    mainClass.set("jvguard.Main")
 }
 
 repositories {
@@ -28,4 +23,15 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+
+    jvmArgs(
+        "-Xmx4G",
+        "-Xms1G",
+        "-XX:+UseG1GC",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=20",
+        "-XX:G1HeapRegionSize=4M",    // smaller regions for high task churn
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC"
+    )
 }

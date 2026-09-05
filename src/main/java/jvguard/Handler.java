@@ -8,23 +8,23 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * jv-guard - Handler
- *
+ * <p>
  * Task routing, phase coordination, and executor handoff.
  * The central dispatch layer sitting between pool queues and executors.
- *
+ * <p>
  * Startup sequence (called after Wrapping.seal()):
- *
+ * <p>
  *     Handler handler = Handler.initialize(poolConfig);
- *
+ * <p>
  *     // Executers register their routes immediately after:
  *     handler.registerRoute("CEXC", (task, onComplete) -> cpuPool.submit(...));
  *     handler.registerRoute("IEXC", (task, onComplete) -> ioPool.submit(...));
  *     handler.registerRoute("AEXC", (task, onComplete) -> asyncPool.submit(...));
- *
+ * <p>
  * Task submission (user-facing, called at runtime):
- *
+ * <p>
  *     Handler.get().submit(taskDescriptor);
- *
+ * <p>
  * Dependency note: Handler imports Pools but NOT Executers.
  * Executers import Handler and register themselves via registerRoute().
  * The dependency runs one way - no circular imports.
@@ -52,7 +52,7 @@ public final class Handler {
     /**
      * Builds the pool registry, starts all idle workers, and returns the Handler.
      * Must be called after Wrapping.seal() and before any Executers start.
-     *
+     * <p>
      * Uses a forward-reference pattern: the TaskDispatcher lambda captures a
      * one-element array that is populated immediately after the registry builds.
      * Workers only begin dispatching after they start (post-build), so the
@@ -67,8 +67,8 @@ public final class Handler {
 
         Handler[] ref = new Handler[1];
 
-        Pools.TaskDispatcher dispatcher = packet -> {
-            if (ref[0] != null) ref[0].onPull(packet);
+        Pools.TaskDispatcher dispatcher = (task, leadSuffix, sourceQueue) -> {
+            if (ref[0] != null) ref[0].onPull(task, leadSuffix, sourceQueue);
         };
 
         Pools.CoreRegistry registry = Pools.build(config, dispatcher);
@@ -103,17 +103,17 @@ public final class Handler {
     /**
      * Registers an executor route for a given EXECUTER tag ("CEXC", "IEXC", "AEXC").
      * Called by Executers.java after its thread pools are built.
-     *
-     * CONTRACT: the onComplete Runnable provided to each route MUST be called
-     * inside a finally block. It handles LEAD suffix release and Phaser signalling.
-     * Failing to call it leaks the suffix permanently and silently stalls
-     * the phase counter.
-     *
-     *     handler.registerRoute("CEXC", (task, onComplete) ->
+     * <p>
+     * CONTRACT: Handler.get().taskComplete(task, leadSuffix, sourceQueue) MUST be
+     * called inside a finally block in the submitted work. It handles LEAD suffix
+     * release and Phaser signalling. Failing to call it leaks the suffix permanently
+     * and silently stalls the phase counter.
+     * <p>
+     *     handler.registerRoute("CEXC", (task, leadSuffix, sourceQueue) ->
      *         cpuPool.submit(() -> {
      *             try   { task.method().invoke(target); }
      *             catch (Exception e) { log.error(...); }
-     *             finally { onComplete.run(); }           // <- non-negotiable
+     *             finally { Handler.get().taskComplete(task, leadSuffix, sourceQueue); }
      *         })
      *     );
      */
@@ -129,7 +129,7 @@ public final class Handler {
     /**
      * Submits a task by OP label. O(1) lookup via the sealed OP index.
      * Primary user-facing submit path - no descriptor reference required.
-     *
+     * <p>
      *     Handler.get().submit("buildMultiJson");
      */
     public void submit(String op) {
@@ -144,16 +144,23 @@ public final class Handler {
     /**
      * Submits a descriptor directly. Use submit(String op) at the call site
      * unless you already hold the descriptor.
-     *
-     * LEAD >= 0  → back skip list (offerBack).
+     * <p>
+     * STATE_LOCK: false + LEAD >= 0  → stateless lead queue (offerStatelessLead).
+     *              Bypasses GROUP phase entirely. Signals any idle worker directly.
+     *              No suffix allocated, no skip-list key, fan-out in parallel.
+     * <p>
+     * STATE_LOCK: true  + LEAD >= 0  → back skip list (offerBack).
      *              Suffix embedded in the entry - travels with the task automatically.
-     * LEAD == -1 → front priority queue (offerFront).
+     * <p>
+     * LEAD == -1                     → front priority queue (offerFront).
      *              Ordered by (GROUP, ORDER) at insertion time.
      */
     public void submit(Wrapping.TaskDescriptor task) {
         Pools.PoolQueue queue = registry.queueFor(task.pool());
 
-        if (task.lead() >= 0) {
+        if (task.isStatelessLead()) {
+            queue.offerStatelessLead(task);
+        } else if (task.lead() >= 0) {
             queue.offerBack(task);
         } else {
             queue.offerFront(task);
@@ -165,29 +172,16 @@ public final class Handler {
     // -------------------------------------------------------------------------
 
     /**
-     * Receives a DispatchPacket from an idle worker and routes it to execution.
-     *
+     * Called by idle workers via TaskDispatcher when a task is pulled.
+     * Fields are passed directly — no heap allocation on this path.
+     * <p>
      * Flow:
      *   1. Record phase acceptance for this task's GROUP/ORDER step.
-     *   2. Build onComplete - releases LEAD suffix (if applicable) and
-     *      signals Phaser arrival. Always runs via executor's finally block.
-     *   3. Lookup registered executor route, hand off task + callback.
+     *   2. Lookup registered executor route, hand off task + raw context.
+     *      The executor calls Handler.taskComplete() in its finally block.
      */
-    private void onPull(Pools.DispatchPacket packet) {
-        Wrapping.TaskDescriptor task = packet.task();
-
+    private void onPull(Wrapping.TaskDescriptor task, int leadSuffix, Pools.PoolQueue sourceQueue) {
         coordinator.onAccept(task);
-
-        Runnable onComplete = () -> {
-            // Release LEAD suffix directly from packet context - no tracking map needed
-            if (packet.isLead()) {
-                packet.sourceQueue().releaseSuffix(
-                        task.lead(),
-                        packet.leadSuffix()
-                );
-            }
-            coordinator.onComplete(task);
-        };
 
         ExecutorRoute route = executorRoutes.get(task.executer());
 
@@ -197,11 +191,29 @@ public final class Handler {
                             + task.executer() + "' - task dropped",
                     task.context()
             );
-            onComplete.run(); // still release suffix and arrive at phaser on drop
+            taskComplete(task, leadSuffix, sourceQueue); // release suffix + phaser on drop
             return;
         }
 
-        route.execute(task, onComplete);
+        route.execute(task, leadSuffix, sourceQueue);
+    }
+
+    /**
+     * Called by executors in their finally block after a task completes.
+     * Replaces the per-task onComplete lambda — no closure allocation.
+     * <p>
+     * Releases the LEAD suffix (if this was a stateful lead task) and
+     * signals Phaser arrival. Stateless leads (leadSuffix == -1, sourceQueue == null)
+     * skip suffix release and go straight to phase tracking.
+     * <p>
+     * CONTRACT: must be called in a finally block. A missed call leaks
+     * the suffix permanently and silently stalls the phase counter.
+     */
+    public void taskComplete(Wrapping.TaskDescriptor task, int leadSuffix, Pools.PoolQueue sourceQueue) {
+        if (leadSuffix >= 1 && sourceQueue != null) {
+            sourceQueue.releaseSuffix(task.lead(), leadSuffix);
+        }
+        coordinator.onComplete(task);
     }
 
     // -------------------------------------------------------------------------
@@ -211,13 +223,17 @@ public final class Handler {
     /**
      * Functional interface for routing a ready task to an executor.
      * Implemented in Executers.java, registered via Handler.registerRoute().
-     *
-     * The onComplete Runnable must be called in a finally block inside the
-     * submitted work. See registerRoute() contract above.
+     * <p>
+     * The executor receives the raw dispatch context (leadSuffix, sourceQueue)
+     * and must call Handler.get().taskComplete(task, leadSuffix, sourceQueue)
+     * in a finally block. This eliminates the per-task onComplete lambda.
+     * <p>
+     * CONTRACT: taskComplete() must always be called in a finally block.
+     * Omitting it leaks LEAD suffixes and silently stalls the phase counter.
      */
     @FunctionalInterface
     public interface ExecutorRoute {
-        void execute(Wrapping.TaskDescriptor task, Runnable onComplete);
+        void execute(Wrapping.TaskDescriptor task, int leadSuffix, Pools.PoolQueue sourceQueue);
     }
 
     // -------------------------------------------------------------------------
@@ -226,26 +242,26 @@ public final class Handler {
 
     /**
      * Tracks GROUP/ORDER phase steps and manages Phaser lifecycle.
-     *
+     * <p>
      * Phase model:
      *   Tasks are accepted from pool queues in ascending GROUP order.
      *   Within a GROUP, tasks are ordered by ascending ORDER value.
      *   The front PriorityQueue in Pools enforces this ordering at poll time -
      *   workers always receive the lowest available (GROUP, ORDER) task.
-     *
+     * <p>
      *   The Phaser is sized to the total worker count and is ready for two modes:
-     *
+     * <p>
      *   Mode 1 (current) - non-blocking tracking:
      *     onComplete() calls phaser.arrive() without waiting. This counts
      *     completions and advances the phase counter without blocking workers.
      *     GROUP/ORDER ordering is maintained by the priority queue alone.
-     *
+     * <p>
      *   Mode 2 (activation-ready) - hard step barriers:
      *     Replace phaser.arrive() with phaser.arriveAndAwaitAdvance() in
      *     onComplete(). All workers then synchronize at each ORDER step before
      *     advancing - "simultaneous acceptance" in the strict sense. No other
      *     code changes required; the Phaser is already sized correctly.
-     *
+     * <p>
      *   GROUP-level barriers (GROUP N fully drains before GROUP N+1 opens):
      *     Layer on top of Mode 2 by detecting GROUP transitions in onAccept()
      *     and using phaser.bulkRegister() / phaser.arriveAndDeregister() to
@@ -274,7 +290,7 @@ public final class Handler {
 
         /**
          * Signals that a task has completed execution.
-         *
+         * <p>
          * Mode 1 (current): non-blocking arrival.
          * Mode 2 (ready):   replace arrive() with arriveAndAwaitAdvance()
          *                   to activate hard step synchronisation.

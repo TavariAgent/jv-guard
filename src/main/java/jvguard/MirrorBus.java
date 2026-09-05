@@ -5,14 +5,14 @@ import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * jv-guard - MirrorBus
- *
+ * <p>
  * Runtime transfer layer for MIRROR chains.
  * Producers route typed results here after execution.
  * Consumers await their result before invoking.
- *
+ * <p>
  * One LinkedBlockingQueue per consumer OP. Handles concurrent invocations
  * of the same chain naturally -- results queue and consumers drain in FIFO order.
- *
+ * <p>
  * Consumer tasks MUST run on AEXC or IEXC (virtual threads). take() parks
  * the virtual thread and frees the carrier -- no OS thread is blocked.
  * CEXC consumers are a Tier 1 violation at seal() and never reach this path.
@@ -64,7 +64,7 @@ public final class MirrorBus {
      * Awaits the next result for this OP. Parks the calling virtual thread
      * until a producer routes a result. Returns the typed-erased result --
      * the executor performs the seal-validated cast before invocation.
-     *
+     * <p>
      * Interruption propagates cleanly -- the executor's finally block
      * calls onComplete() regardless.
      */

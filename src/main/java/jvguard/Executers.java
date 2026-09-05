@@ -8,25 +8,25 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * jv-guard - Executers
- *
+ * <p>
  * Three running executors, each handling a specific work category:
- *
+ * <p>
  *   runningCpuExecutor   - CEXC - fixed OS thread pool, CPU-bound work
  *   runningIoExecutor    - IEXC - virtual thread per task, IO-bound work
  *   runningAsyncExecutor - AEXC - virtual thread per task, async work
- *
+ * <p>
  * Invocation path:
  *   If TaskDescriptor.cachedHandle() is non-null, invokeExact() is called
  *   directly -- no reflection overhead. After JIT warmup this becomes an
  *   inlined direct call. Tasks with a null handle fall back to Method.invoke().
  *   Both paths throw Throwable; catch blocks handle both uniformly.
- *
+ * <p>
  * Startup (after Handler.initialize()):
- *
+ * <p>
  *     Executers.start();
- *
+ * <p>
  * Shutdown (before JVM exit):
- *
+ * <p>
  *     Executers.shutdown();
  *     Pools.getRegistry().shutdown();
  */
@@ -47,11 +47,11 @@ public final class Executers {
     /**
      * Builds all three executors and registers their routes with Handler.
      * Must be called after Handler.initialize().
-     *
+     * <p>
      * runningCpuExecutor:
      *   Fixed OS thread pool sized to availableProcessors().
      *   OS threads hold the core -- correct for CPU-bound work that must not yield.
-     *
+     * <p>
      * runningIoExecutor / runningAsyncExecutor:
      *   Virtual thread per task (Project Loom, JDK 21+).
      *   IO blocks park the virtual thread and yield the carrier -- the carrier
@@ -75,7 +75,7 @@ public final class Executers {
                 Thread.ofVirtual().name("jvg-async-", 0).factory()
         );
 
-        handler.registerRoute("CEXC", (task, onComplete) ->
+        handler.registerRoute("CEXC", (task, leadSuffix, sourceQueue) ->
                 runningCpuExecutor.submit(() -> {
                     try {
                         if (task.isMirrorProducer()) invokeProducer(task);
@@ -83,12 +83,12 @@ public final class Executers {
                     } catch (Throwable e) {
                         log.error("task threw: " + e.getMessage(), task.context());
                     } finally {
-                        onComplete.run();
+                        Handler.get().taskComplete(task, leadSuffix, sourceQueue);
                     }
                 })
         );
 
-        handler.registerRoute("IEXC", (task, onComplete) ->
+        handler.registerRoute("IEXC", (task, leadSuffix, sourceQueue) ->
                 runningIoExecutor.submit(() -> {
                     try {
                         if      (task.isMirrorProducer() && task.isMirrorConsumer()) invokeMidChain(task);
@@ -98,12 +98,12 @@ public final class Executers {
                     } catch (Throwable e) {
                         log.error("task threw: " + e.getMessage(), task.context());
                     } finally {
-                        onComplete.run();
+                        Handler.get().taskComplete(task, leadSuffix, sourceQueue);
                     }
                 })
         );
 
-        handler.registerRoute("AEXC", (task, onComplete) ->
+        handler.registerRoute("AEXC", (task, leadSuffix, sourceQueue) ->
                 runningAsyncExecutor.submit(() -> {
                     try {
                         if      (task.isMirrorProducer() && task.isMirrorConsumer()) invokeMidChain(task);
@@ -113,7 +113,7 @@ public final class Executers {
                     } catch (Throwable e) {
                         log.error("task threw: " + e.getMessage(), task.context());
                     } finally {
-                        onComplete.run();
+                        Handler.get().taskComplete(task, leadSuffix, sourceQueue);
                     }
                 })
         );

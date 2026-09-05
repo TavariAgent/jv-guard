@@ -13,20 +13,20 @@ import java.util.stream.Collectors;
 
 /**
  * jv-guard - Wrapping
- *
+ * <p>
  * Registration, validation, and seal for the jv-guard engine.
  * No executor starts before seal() passes clean.
- *
+ * <p>
  * Startup sequence:
- *
+ * <p>
  *     Wrapping.register(new OrderService());    // instance methods
  *     Wrapping.registerStatic(UtilTasks.class); // static methods
  *     Wrapping.seal();                          // validate + lock
- *
+ * <p>
  * After seal(), tasks are accessible by OP name for submission:
- *
+ * <p>
  *     Handler.get().submit("buildMultiJson");
- *
+ * <p>
  * MethodHandle caching:
  *   For every @Task(CACHE = true) method (the default), seal() pre-builds
  *   a no-arg MethodHandle bound to the target instance. Executers call
@@ -131,13 +131,14 @@ public final class Wrapping {
                     annotation.GROUP(),
                     annotation.ORDER(),
                     annotation.LEAD(),
+                    annotation.STATE_LOCK(),  // stateLock -- bypasses GROUP phase when false
                     mirror,
                     method,
                     target,
                     handle,
                     rawHandle,
                     null,   // mirrorOutputType -- resolved at seal() during chain walk
-                    null // mirrorInputType  -- resolved at seal() during chain walk
+                    null    // mirrorInputType  -- resolved at seal() during chain walk
             ));
             found++;
         }
@@ -152,10 +153,10 @@ public final class Wrapping {
 
     /**
      * Builds a pre-bound, no-arg MethodHandle for the given method.
-     *
+     * <p>
      * For no-arg methods: binds the target instance and normalises the return
      * type to void. invokeExact() takes no arguments.
-     *
+     * <p>
      * For parameterized methods: binds the target instance, then uses
      * MethodHandles.insertArguments() to pre-bind the constant args from the
      * same-named Object[] field. The result is still a no-arg void handle.
@@ -163,7 +164,7 @@ public final class Wrapping {
      * boxed primitives in the Object[] match primitive parameter types cleanly.
      * A type mismatch here throws IllegalArgumentException, which the catch
      * converts to a null handle -- seal() blocks the task as Tier 1.
-     *
+     * <p>
      * Returns null and logs a warning if construction fails for any reason.
      */
     private static MethodHandle buildHandle(
@@ -218,19 +219,19 @@ public final class Wrapping {
     /**
      * Looks up a same-named static Object[] field on the class to use as
      * pre-bound constant args for a parameterized @Task method.
-     *
+     * <p>
      * Convention: declare a static final Object[] with the same name as the
      * decorated method in the same class:
-     *
+     * <p>
      *     static final Object[] buildMultiJson = { "json", 100 };
-     *
+     * <p>
      *     Task(POOL = "I", EXECUTER = "CEXC", OP = "buildMultiJson", GROUP = 0)
      *     public void buildMultiJson(String format, int limit) { ... }
-     *
+     * <p>
      * The field must be static. Instance fields are ignored with a warning since
      * they carry per-instance state rather than constants, which breaks the
      * pre-binding model -- args are locked in at seal time, not per invocation.
-     *
+     * <p>
      * Returns null (without error) when no matching field exists -- the absence
      * is only an error if the method is parameterized, which seal() checks.
      */
@@ -277,14 +278,14 @@ public final class Wrapping {
 
     /**
      * Validates all pending tasks and locks the registry.
-     *
+     * <p>
      * Tier 1 - POOL, EXECUTER, OP, GROUP, LEAD
      *   Hard block. All violations collected and thrown together in one error.
-     *
+     * <p>
      * Tier 2 - ORDER (conditional on LEAD)
      *   LEAD >= 0 + invalid ORDER  -> hard block (promotion arithmetic breaks).
      *   LEAD == -1 + invalid ORDER -> auto-corrected to 0.0, warning logged.
-     *
+     * <p>
      * Returns the sealed, unmodifiable task list.
      */
     public static List<TaskDescriptor> seal() {
@@ -408,9 +409,9 @@ public final class Wrapping {
             );
         }
 
-        sealedRegistry = Collections.unmodifiableList(finalRegistry);
-        opIndex = sealedRegistry.stream()
-                .collect(Collectors.toUnmodifiableMap(TaskDescriptor::op, t -> t));
+        sealedRegistry = List.copyOf(finalRegistry);
+        opIndex = Map.copyOf(finalRegistry.stream()
+                .collect(Collectors.toMap(TaskDescriptor::op, t -> t)));
 
         // Mirror chain validation pass -- runs after opIndex is built so lookups are O(1).
         // Validates type compatibility at each edge, writes types into descriptors.
@@ -492,12 +493,12 @@ public final class Wrapping {
 
         // Rebuild registry and index with typed descriptors applied
         if (!typedOverrides.isEmpty()) {
-            List<TaskDescriptor> typedRegistry = finalRegistry.stream()
+            sealedRegistry = finalRegistry.stream()
                     .map(t -> typedOverrides.getOrDefault(t.op(), t))
-                    .collect(Collectors.toList());
-            sealedRegistry = Collections.unmodifiableList(typedRegistry);
-            opIndex = sealedRegistry.stream()
-                    .collect(Collectors.toUnmodifiableMap(TaskDescriptor::op, t -> t));
+                    .toList();
+
+            opIndex = Map.copyOf(sealedRegistry.stream()
+                    .collect(Collectors.toMap(TaskDescriptor::op, t -> t)));
         }
 
         log.info("registry sealed - "
@@ -539,15 +540,15 @@ public final class Wrapping {
 
     /**
      * Immutable snapshot of a single @Task decorated method.
-     *
+     * <p>
      * Built at registration time from annotation values and the target instance.
      * ORDER may be corrected at seal() via withOrder(). cachedHandle is built
      * during registration for CACHE=true methods and carried through unchanged.
-     *
+     * <p>
      * cachedHandle: pre-bound no-arg MethodHandle. null if CACHE=false,
      *               if trySetAccessible() failed, or if handle construction failed.
      *               Executers call invokeExact() when non-null, reflection otherwise.
-     *
+     * <p>
      * target: the object instance to invoke the method on.
      *         null for static @Task methods - Method.invoke(null) is correct.
      */
@@ -560,6 +561,7 @@ public final class Wrapping {
             int          group,
             double       order,
             int          lead,
+            boolean      stateLock,          // STATE_LOCK annotation value
             String       mirror,
             Method       method,
             Object       target,
@@ -573,10 +575,17 @@ public final class Wrapping {
         public boolean isMirrorProducer() { return mirror != null && !mirror.isEmpty(); }
         public boolean isMirrorConsumer() { return mirrorInputType != null; }
 
+        /**
+         * True when this task bypasses GROUP phase and skip-list ordering.
+         * Stateless leads dispatch directly to any free worker via work signal.
+         * Condition: STATE_LOCK = false AND LEAD >= 0.
+         */
+        public boolean isStatelessLead()  { return !stateLock && lead >= 0; }
+
         public TaskDescriptor withOrder(double correctedOrder) {
             return new TaskDescriptor(
                     className, methodName, pool, executer, op,
-                    group, correctedOrder, lead, mirror,
+                    group, correctedOrder, lead, stateLock, mirror,
                     method, target, cachedHandle, rawHandle,
                     mirrorOutputType, mirrorInputType
             );
@@ -586,7 +595,7 @@ public final class Wrapping {
         public TaskDescriptor withMirrorTypes(Class<?> outputType, Class<?> inputType) {
             return new TaskDescriptor(
                     className, methodName, pool, executer, op,
-                    group, order, lead, mirror,
+                    group, order, lead, stateLock, mirror,
                     method, target, cachedHandle, rawHandle,
                     outputType, inputType
             );
